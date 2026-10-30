@@ -3,6 +3,7 @@
 
     python scripts/run_cluster.py            # start and stay in the foreground
     python scripts/run_cluster.py --reset    # wipe shard data and the map first
+    python scripts/run_cluster.py --stop     # stop a cluster started earlier
 
 Each shard is a genuinely separate OS process with its own SQLite file; the
 router only ever reaches them over HTTP.  Logs land in logs/<name>.log.
@@ -27,6 +28,7 @@ from shardstore.config import ClusterConfig  # noqa: E402
 from shardstore.shardmap import ShardMap  # noqa: E402
 
 LOG_DIR = ROOT / "logs"
+PID_FILE = LOG_DIR / "cluster.pid"
 
 
 def python_bin() -> str:
@@ -54,13 +56,40 @@ def spawn(name: str, args: list[str], env: dict[str, str]) -> subprocess.Popen:
     )
 
 
+def stop_running_cluster() -> int:
+    if not PID_FILE.exists():
+        print("no cluster.pid; nothing to stop")
+        return 0
+    pid = int(PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print(f"launcher {pid} is already gone")
+        PID_FILE.unlink(missing_ok=True)
+        return 0
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    PID_FILE.unlink(missing_ok=True)
+    print(f"stopped cluster (launcher pid {pid})")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
     parser.add_argument("--reset", action="store_true",
                         help="delete shard databases and rebuild the shard map")
     parser.add_argument("--log-level", default="warning")
+    parser.add_argument("--stop", action="store_true",
+                        help="stop the cluster recorded in logs/cluster.pid")
     args = parser.parse_args()
+
+    if args.stop:
+        return stop_running_cluster()
 
     cfg = ClusterConfig.load(args.config)
 
@@ -83,6 +112,8 @@ def main() -> int:
             print(f"shard map bootstrapped with {cfg.num_chunks} chunks")
         print(f"shard map  : {cfg.shard_map_file} (version {smap.version})")
 
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
     procs: list[tuple[str, subprocess.Popen]] = []
 
     def shutdown(*_: object) -> None:
@@ -94,6 +125,7 @@ def main() -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        PID_FILE.unlink(missing_ok=True)
         print("\ncluster stopped")
 
     signal.signal(signal.SIGINT, lambda *_: (shutdown(), sys.exit(0)))
