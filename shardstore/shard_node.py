@@ -5,7 +5,7 @@ and answers key lookups and filter queries over its own documents only.
 Launch one per shard:
 
     SHARD_ID=shard-0 SHARD_DB=data/shard-0.db \
-        uvicorn shardstore.shard_node:app --port 9101
+        uvicorn shardstore.shard_node:app_from_env --factory --port 9101
 """
 
 from __future__ import annotations
@@ -151,6 +151,3 @@ def app_from_env() -> FastAPI:
     except KeyError as exc:
         raise RuntimeError(f"environment variable {exc} is required") from exc
     return create_app(shard_id, db_path, os.environ.get("SHARD_KEY", "_id"))
-
-
-app = app_from_env() if os.environ.get("SHARD_ID") else None
