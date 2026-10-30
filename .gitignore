@@ -4,7 +4,6 @@ __pycache__/
 .pytest_cache/
 data/
 logs/
-results/
 *.db
 *.db-journal
 *.db-wal
