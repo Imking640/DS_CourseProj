@@ -1,0 +1,16 @@
+{
+  "cluster_id": "ds-shard-store",
+  "shard_key": "_id",
+  "shard_map_path": "data/shardmap.db",
+  "num_chunks": 8,
+  "router": {
+    "host": "127.0.0.1",
+    "port": 9000
+  },
+  "shards": [
+    { "shard_id": "shard-0", "host": "127.0.0.1", "port": 9101, "data_path": "data/shard-0.db" },
+    { "shard_id": "shard-1", "host": "127.0.0.1", "port": 9102, "data_path": "data/shard-1.db" },
+    { "shard_id": "shard-2", "host": "127.0.0.1", "port": 9103, "data_path": "data/shard-2.db" },
+    { "shard_id": "shard-3", "host": "127.0.0.1", "port": 9104, "data_path": "data/shard-3.db" }
+  ]
+}
