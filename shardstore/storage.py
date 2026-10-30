@@ -12,10 +12,14 @@ import json
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .filters import FilterError, apply_sort, matches, normalise_sort, project, validate_filter
+from .filters import (
+    FilterError, apply_sort, extract_shard_keys, matches, normalise_sort, project,
+    validate_filter,
+)
 from .hashing import hash_key
 
 SCHEMA = """
@@ -43,6 +47,15 @@ class DuplicateKeyError(StorageError):
 
 class DocumentNotFound(StorageError):
     """Raised when a targeted update or delete matches nothing."""
+
+
+@dataclass(slots=True)
+class ScanResult:
+    """Documents plus how they were found -- reported back by the router."""
+
+    documents: list[dict[str, Any]]
+    examined: int
+    indexed: bool
 
 
 # -- update operators --------------------------------------------------
@@ -243,16 +256,39 @@ class DocumentStore:
             ).fetchone()
         return json.loads(row["body"]) if row else None
 
-    def _scan(self, hash_range: tuple[int, int] | None) -> list[sqlite3.Row]:
-        with self._lock:
-            if hash_range is None:
-                return self._conn.execute("SELECT body FROM documents").fetchall()
-            return self._conn.execute(
-                "SELECT body FROM documents WHERE key_hash >= ? AND key_hash < ?",
-                hash_range,
-            ).fetchall()
+    def _candidates(
+        self,
+        filt: dict[str, Any] | None,
+        hash_range: tuple[int, int] | None,
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Rows that could match, plus whether an index was used.
 
-    def find(
+        A filter that pins the shard key becomes a primary-key lookup, so a
+        directly routed query costs an index seek rather than a full scan of
+        the shard.  Anything else falls back to scanning (optionally limited
+        to one chunk's hash range).
+        """
+        keys = extract_shard_keys(filt, self.shard_key)
+        clauses: list[str] = []
+        params: list[Any] = []
+        indexed = False
+
+        if keys is not None and len(keys) > 0:
+            ids = [str(k) for k in keys]
+            clauses.append(f"doc_id IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+            indexed = True
+        if hash_range is not None:
+            clauses.append("key_hash >= ? AND key_hash < ?")
+            params.extend(hash_range)
+
+        sql = "SELECT body FROM documents"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall(), indexed
+
+    def query(
         self,
         filt: dict[str, Any] | None = None,
         sort: Any = None,
@@ -260,18 +296,27 @@ class DocumentStore:
         skip: int = 0,
         fields: Sequence[str] | None = None,
         hash_range: tuple[int, int] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> ScanResult:
         """Filter-query this shard; ``limit`` is applied after sorting."""
         validate_filter(filt)
         order = normalise_sort(sort)
-        docs = [json.loads(r["body"]) for r in self._scan(hash_range)]
-        docs = [d for d in docs if matches(d, filt)]
-        docs = apply_sort(docs, order)
+        rows, indexed = self._candidates(filt, hash_range)
+        docs = [json.loads(r["body"]) for r in rows]
+        matched = [d for d in docs if matches(d, filt)]
+        matched = apply_sort(matched, order)
         if skip:
-            docs = docs[skip:]
+            matched = matched[skip:]
         if limit is not None:
-            docs = docs[:limit]
-        return [project(d, fields) for d in docs]
+            matched = matched[:limit]
+        return ScanResult(
+            documents=[project(d, fields) for d in matched],
+            examined=len(rows),
+            indexed=indexed,
+        )
+
+    def find(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """``query`` without the scan statistics."""
+        return self.query(*args, **kwargs).documents
 
     def count(
         self,
@@ -282,7 +327,8 @@ class DocumentStore:
         if not filt and hash_range is None:
             with self._lock:
                 return self._conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-        return sum(1 for r in self._scan(hash_range) if matches(json.loads(r["body"]), filt))
+        rows, _ = self._candidates(filt, hash_range)
+        return sum(1 for r in rows if matches(json.loads(r["body"]), filt))
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -296,5 +342,14 @@ class DocumentStore:
             "max_key_hash": row["hi"],
             "last_write_at": row["last"],
             "path": str(self.path),
-            "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
+            "size_bytes": self._disk_size(),
         }
+
+    def _disk_size(self) -> int:
+        """On-disk footprint, including the write-ahead log."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(str(self.path) + suffix)
+            if candidate.exists():
+                total += candidate.stat().st_size
+        return total

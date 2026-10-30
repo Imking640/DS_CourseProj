@@ -115,7 +115,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id") -> FastAPI:
     def query(req: QueryRequest) -> ShardQueryResponse:
         t0 = time.perf_counter()
         try:
-            docs = store.find(
+            result = store.query(
                 req.filter,
                 sort=req.sort,
                 limit=req.limit,
@@ -127,9 +127,10 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id") -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return ShardQueryResponse(
             shard_id=shard_id,
-            count=len(docs),
-            documents=docs,
-            scanned=store.count(hash_range=req.hash_range),
+            count=len(result.documents),
+            documents=result.documents,
+            examined=result.examined,
+            indexed=result.indexed,
             took_ms=(time.perf_counter() - t0) * 1000,
         )
 

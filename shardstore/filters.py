@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, Sequence
 
+from .hashing import canonical
+
 MISSING = object()
 
 COMPARISON_OPS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte"}
@@ -262,3 +264,80 @@ def project(doc: dict[str, Any], fields: Sequence[str] | None) -> dict[str, Any]
         if value is not MISSING:
             out[field] = value
     return out
+
+
+# -- shard-key analysis ------------------------------------------------
+
+
+class KeySet:
+    """A set of shard-key values, deduplicated by canonical JSON form.
+
+    ``None`` is used elsewhere to mean "unconstrained"; this type only ever
+    represents an explicit, finite set of candidate keys.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Iterable[Any] = ()) -> None:
+        self._values: dict[str, Any] = {canonical(v): v for v in values}
+
+    def __iter__(self):
+        return iter(self._values.values())
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __and__(self, other: "KeySet") -> "KeySet":
+        out = KeySet()
+        out._values = {k: v for k, v in self._values.items() if k in other._values}
+        return out
+
+    def __or__(self, other: "KeySet") -> "KeySet":
+        out = KeySet()
+        out._values = {**self._values, **other._values}
+        return out
+
+    def __repr__(self) -> str:
+        return f"KeySet({list(self._values.values())!r})"
+
+
+def _narrow(current: KeySet | None, found: KeySet | None) -> KeySet | None:
+    """Intersect two constraints, where ``None`` means "no constraint"."""
+    if found is None:
+        return current
+    return found if current is None else current & found
+
+
+def extract_shard_keys(filt: Any, shard_key: str = "_id") -> KeySet | None:
+    """Pull the shard-key equality constraints out of a filter.
+
+    Returns ``None`` when the filter does not pin the shard key.  The router
+    reads this to choose between direct routing and scatter-gather, and a
+    shard reads it to turn a pinned filter into a primary-key lookup instead
+    of a collection scan.
+    """
+    if not isinstance(filt, dict) or not filt:
+        return None
+    keys: KeySet | None = None
+    for field_name, condition in filt.items():
+        if field_name == "$and":
+            for sub in condition:
+                keys = _narrow(keys, extract_shard_keys(sub, shard_key))
+        elif field_name == "$or":
+            branch: KeySet | None = None
+            for sub in condition:
+                sub_keys = extract_shard_keys(sub, shard_key)
+                if sub_keys is None:          # one unconstrained branch ...
+                    branch = None             # ... makes the whole $or unconstrained
+                    break
+                branch = sub_keys if branch is None else branch | sub_keys
+            keys = _narrow(keys, branch)
+        elif field_name == shard_key:
+            if isinstance(condition, dict) and any(k.startswith("$") for k in condition):
+                if "$eq" in condition:
+                    keys = _narrow(keys, KeySet([condition["$eq"]]))
+                elif "$in" in condition and isinstance(condition["$in"], list):
+                    keys = _narrow(keys, KeySet(condition["$in"]))
+            else:
+                keys = _narrow(keys, KeySet([condition]))
+    return keys

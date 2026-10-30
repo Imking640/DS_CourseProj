@@ -121,3 +121,39 @@ def test_data_survives_reopening_the_file(tmp_path):
     second = DocumentStore(path)
     assert second.get("u1") == {"_id": "u1", "age": 7}
     second.close()
+
+
+def test_a_pinned_shard_key_becomes_an_index_seek(store):
+    store.insert_many([{"_id": f"u{i}", "age": i} for i in range(500)])
+    pinned = store.query({"_id": "u42"})
+    assert pinned.indexed is True
+    assert pinned.examined == 1
+    assert [d["_id"] for d in pinned.documents] == ["u42"]
+
+    combined = store.query({"_id": "u42", "age": {"$gte": 0}})
+    assert combined.indexed is True and combined.examined == 1
+
+    in_list = store.query({"_id": {"$in": ["u1", "u2", "u9"]}})
+    assert in_list.indexed is True and in_list.examined == 3
+
+
+def test_an_unpinned_filter_scans_the_collection(store):
+    store.insert_many([{"_id": f"u{i}", "age": i} for i in range(500)])
+    scan = store.query({"age": {"$gte": 490}})
+    assert scan.indexed is False
+    assert scan.examined == 500
+    assert len(scan.documents) == 10
+
+
+def test_a_hash_range_narrows_the_scan(store):
+    store.insert_many([{"_id": f"u{i}"} for i in range(500)])
+    narrowed = store.query(hash_range=(0, 2 ** 31))
+    assert narrowed.indexed is False
+    assert 0 < narrowed.examined < 500
+    assert narrowed.examined == len(narrowed.documents)
+
+
+def test_a_pinned_filter_still_applies_the_other_predicates(store):
+    store.insert_many([{"_id": "u1", "age": 10}, {"_id": "u2", "age": 20}])
+    assert store.find({"_id": "u1", "age": 20}) == []
+    assert store.find({"_id": {"$in": ["u1", "u2"]}, "age": {"$gt": 15}})[0]["_id"] == "u2"

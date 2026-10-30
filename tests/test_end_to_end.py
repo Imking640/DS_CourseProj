@@ -153,3 +153,15 @@ def test_routing_follows_the_shard_map_not_the_data(seeded):
         body = seeded.get(f"/documents/{doc['_id']}").json()
         chunk = next(c for c in snapshot["chunks"] if c["chunk_id"] == body["routing"]["chunk_id"])
         assert body["routing"]["shards"] == [chunk["owner"]]
+
+
+def test_a_directly_routed_query_examines_only_one_document(seeded):
+    body = seeded.post("/query", json={"filter": {"_id": "u4"}}).json()
+    assert body["routing"]["mode"] == "direct"
+    assert body["examined"] == 1
+
+
+def test_a_scatter_gather_query_examines_the_whole_collection(seeded):
+    body = seeded.post("/query", json={"filter": {"city": "Delhi"}}).json()
+    assert body["routing"]["mode"] == "scatter-gather"
+    assert body["examined"] == len(PEOPLE)

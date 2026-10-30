@@ -250,6 +250,7 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
             routing=RoutingInfo(**plan.as_info()),
             count=len(documents),
             documents=documents,
+            examined=sum(payload["examined"] for payload in payloads),
             took_ms=round((time.perf_counter() - t0) * 1000, 3),
             per_shard_ms=timings,
         )

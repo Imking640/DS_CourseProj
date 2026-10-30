@@ -59,7 +59,8 @@ class ShardQueryResponse(BaseModel):
     shard_id: str
     count: int
     documents: list[dict[str, Any]]
-    scanned: int
+    examined: int          # documents the shard had to look at
+    indexed: bool          # True when the shard key turned it into a seek
     took_ms: float
 
 
@@ -78,5 +79,6 @@ class RouterQueryResponse(BaseModel):
     routing: RoutingInfo
     count: int
     documents: list[dict[str, Any]]
+    examined: int = 0
     took_ms: float
     per_shard_ms: dict[str, float] = {}
