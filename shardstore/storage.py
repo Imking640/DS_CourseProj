@@ -197,6 +197,15 @@ class DocumentStore:
             self._write(doc, version=1)
         return doc
 
+    def replace_all(self, docs: Iterable[dict[str, Any]]) -> int:
+        """Atomically replace this replica's complete document contents."""
+        docs = list(docs)
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM documents")
+            for doc in docs:
+                self._write(doc, version=1)
+        return len(docs)
+
     def insert_many(self, docs: Iterable[dict[str, Any]], overwrite: bool = False) -> int:
         docs = list(docs)
         with self._lock, self._conn:

@@ -26,6 +26,8 @@ def main() -> int:
             num_chunks=cfg.num_chunks,
             shard_key=cfg.shard_key,
             force=args.force,
+            followers=[(s.follower.shard_id, s.follower.host, s.follower.port, s.shard_id)
+                       for s in cfg.shards if s.follower],
         )
 
     print(f"shard map  : {cfg.shard_map_file}")

@@ -6,7 +6,7 @@ endpoints deliberately speak the same shapes so the router is a thin proxy.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,7 @@ class QueryRequest(BaseModel):
     fields: list[str] | None = None
     hash_lo: int | None = None
     hash_hi: int | None = None
+    read_preference: Literal["primary", "follower"] = "primary"
 
     @property
     def hash_range(self) -> tuple[int, int] | None:
@@ -47,6 +48,7 @@ class CountRequest(BaseModel):
     filter: dict[str, Any] | None = None
     hash_lo: int | None = None
     hash_hi: int | None = None
+    read_preference: Literal["primary", "follower"] = "primary"
 
     @property
     def hash_range(self) -> tuple[int, int] | None:
@@ -73,6 +75,8 @@ class RoutingInfo(BaseModel):
     chunk_id: int | None = None
     map_version: int = 0
     fanout: int = 1
+    read_preference: str = "primary"
+    read_source: str = "primary"
 
 
 class RouterQueryResponse(BaseModel):

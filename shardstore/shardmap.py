@@ -1,14 +1,4 @@
-"""Persistent shard map: the cluster's single source of truth for routing.
-
-The map is a small SQLite database (the analogue of a MongoDB config server).
-It records the registered shards and the chunk table -- a partition of the
-32-bit hash space into half-open ``[lo, hi)`` ranges, each owned by one shard.
-
-Every mutation bumps a monotonic ``version``.  Readers (the query router) hold
-an immutable :class:`ShardMapSnapshot` and only rebuild it when the version
-moves, so routing a request costs one integer bisect.
-"""
-
+"""Persistent shard map with replica membership and ownership epochs."""
 from __future__ import annotations
 
 import sqlite3
@@ -21,32 +11,28 @@ from typing import Any, Iterable, Sequence
 from .hashing import HASH_SPACE, even_ranges, hash_key
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS shards (
-    shard_id TEXT PRIMARY KEY,
-    host     TEXT    NOT NULL,
-    port     INTEGER NOT NULL,
-    state    TEXT    NOT NULL DEFAULT 'online'
+ shard_id TEXT PRIMARY KEY, host TEXT NOT NULL, port INTEGER NOT NULL,
+ state TEXT NOT NULL DEFAULT 'online'
 );
-
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id INTEGER PRIMARY KEY,
-    lo       INTEGER NOT NULL,
-    hi       INTEGER NOT NULL,
-    owner    TEXT    NOT NULL REFERENCES shards(shard_id),
-    state    TEXT    NOT NULL DEFAULT 'stable'
+ chunk_id INTEGER PRIMARY KEY, lo INTEGER NOT NULL, hi INTEGER NOT NULL,
+ owner TEXT NOT NULL REFERENCES shards(shard_id), state TEXT NOT NULL DEFAULT 'stable'
 );
-
 CREATE INDEX IF NOT EXISTS chunks_by_lo ON chunks(lo);
+CREATE TABLE IF NOT EXISTS replicas (
+ primary_id TEXT PRIMARY KEY REFERENCES shards(shard_id),
+ follower_id TEXT NOT NULL UNIQUE REFERENCES shards(shard_id),
+ active_id TEXT NOT NULL REFERENCES shards(shard_id),
+ epoch INTEGER NOT NULL DEFAULT 1,
+ promoted_at REAL
+);
 """
 
 
 class ShardMapError(RuntimeError):
-    """Raised when the shard map is missing, empty or inconsistent."""
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,19 +47,13 @@ class ShardInfo:
         return f"http://{self.host}:{self.port}"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "shard_id": self.shard_id,
-            "host": self.host,
-            "port": self.port,
-            "state": self.state,
-            "base_url": self.base_url,
-        }
+        return {"shard_id": self.shard_id, "host": self.host,
+                "port": self.port, "state": self.state,
+                "base_url": self.base_url}
 
 
 @dataclass(frozen=True, slots=True)
 class Chunk:
-    """A half-open range ``[lo, hi)`` of the hash space owned by one shard."""
-
     chunk_id: int
     lo: int
     hi: int
@@ -84,55 +64,38 @@ class Chunk:
         return self.lo <= key_hash < self.hi
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "chunk_id": self.chunk_id,
-            "lo": self.lo,
-            "hi": self.hi,
-            "owner": self.owner,
-            "state": self.state,
-        }
+        return {"chunk_id": self.chunk_id, "lo": self.lo, "hi": self.hi,
+                "owner": self.owner, "state": self.state}
 
 
 class ShardMapSnapshot:
-    """Immutable, bisect-indexed view of one version of the shard map."""
+    __slots__ = ("version", "shard_key", "shards", "chunks", "_lows",
+                 "_shards_by_id", "replicas")
 
-    __slots__ = ("version", "shard_key", "shards", "chunks", "_lows", "_shards_by_id")
-
-    def __init__(
-        self,
-        version: int,
-        shard_key: str,
-        shards: Iterable[ShardInfo],
-        chunks: Iterable[Chunk],
-    ) -> None:
+    def __init__(self, version: int, shard_key: str,
+                 shards: Iterable[ShardInfo], chunks: Iterable[Chunk],
+                 replicas: Iterable[dict[str, Any]] = ()) -> None:
         self.version = version
         self.shard_key = shard_key
-        self.shards: tuple[ShardInfo, ...] = tuple(shards)
-        self.chunks: tuple[Chunk, ...] = tuple(sorted(chunks, key=lambda c: c.lo))
+        self.shards = tuple(shards)
+        self.chunks = tuple(sorted(chunks, key=lambda c: c.lo))
         self._lows = [c.lo for c in self.chunks]
         self._shards_by_id = {s.shard_id: s for s in self.shards}
+        self.replicas = {r["primary_id"]: dict(r) for r in replicas}
         self._validate()
 
     def _validate(self) -> None:
         if not self.chunks:
-            raise ShardMapError("shard map has no chunks; run scripts/init_shardmap.py")
+            raise ShardMapError("shard map has no chunks; initialise it first")
         expected = 0
         for chunk in self.chunks:
-            if chunk.lo != expected:
-                raise ShardMapError(
-                    f"chunk {chunk.chunk_id} starts at {chunk.lo}, expected {expected}"
-                )
-            if chunk.hi <= chunk.lo:
-                raise ShardMapError(f"chunk {chunk.chunk_id} is empty or inverted")
+            if chunk.lo != expected or chunk.hi <= chunk.lo:
+                raise ShardMapError(f"invalid chunk range at chunk {chunk.chunk_id}")
             if chunk.owner not in self._shards_by_id:
-                raise ShardMapError(
-                    f"chunk {chunk.chunk_id} owned by unknown shard {chunk.owner!r}"
-                )
+                raise ShardMapError(f"unknown chunk owner {chunk.owner!r}")
             expected = chunk.hi
         if expected != HASH_SPACE:
             raise ShardMapError(f"chunks cover {expected} of {HASH_SPACE} hash slots")
-
-    # -- lookup ---------------------------------------------------------
 
     def chunk_for_hash(self, key_hash: int) -> Chunk:
         if not 0 <= key_hash < HASH_SPACE:
@@ -143,7 +106,6 @@ class ShardMapSnapshot:
         return self.chunk_for_hash(hash_key(key))
 
     def shard_for_key(self, key: Any) -> ShardInfo:
-        """The shard-key-to-shard lookup used for every targeted operation."""
         return self._shards_by_id[self.chunk_for_key(key).owner]
 
     def shard(self, shard_id: str) -> ShardInfo:
@@ -152,35 +114,39 @@ class ShardMapSnapshot:
         except KeyError:
             raise ShardMapError(f"unknown shard {shard_id!r}") from None
 
-    def owners(self) -> tuple[ShardInfo, ...]:
-        """Every shard that currently owns at least one chunk."""
-        ids = {c.owner for c in self.chunks}
-        return tuple(s for s in self.shards if s.shard_id in ids)
+    def replica_for(self, shard_id: str) -> dict[str, Any] | None:
+        for replica in self.replicas.values():
+            if shard_id in (replica["primary_id"], replica["follower_id"]):
+                return replica
+        return None
+
+    def epoch_for(self, shard_id: str) -> int:
+        replica = self.replica_for(shard_id)
+        return int(replica["epoch"]) if replica else 1
 
     def chunks_of(self, shard_id: str) -> tuple[Chunk, ...]:
         return tuple(c for c in self.chunks if c.owner == shard_id)
 
+    def owners(self) -> tuple[ShardInfo, ...]:
+        ids = {c.owner for c in self.chunks}
+        return tuple(s for s in self.shards if s.shard_id in ids)
+
     def coverage(self) -> dict[str, float]:
-        """Fraction of the hash space owned by each shard."""
-        totals: dict[str, int] = {s.shard_id: 0 for s in self.shards}
+        totals = {s.shard_id: 0 for s in self.shards}
         for chunk in self.chunks:
             totals[chunk.owner] += chunk.hi - chunk.lo
         return {k: v / HASH_SPACE for k, v in totals.items()}
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "version": self.version,
-            "shard_key": self.shard_key,
-            "hash_space": HASH_SPACE,
-            "shards": [s.as_dict() for s in self.shards],
-            "chunks": [c.as_dict() for c in self.chunks],
-            "coverage": self.coverage(),
-        }
+        return {"version": self.version, "shard_key": self.shard_key,
+                "hash_space": HASH_SPACE,
+                "shards": [s.as_dict() for s in self.shards],
+                "chunks": [c.as_dict() for c in self.chunks],
+                "replicas": list(self.replicas.values()),
+                "coverage": self.coverage()}
 
 
 class ShardMap:
-    """Read/write handle on the persistent shard map database."""
-
     def __init__(self, path: str | Path, read_only: bool = False) -> None:
         self.path = Path(path)
         self.read_only = read_only
@@ -188,9 +154,8 @@ class ShardMap:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         elif not self.path.exists():
             raise ShardMapError(f"shard map {self.path} does not exist")
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         if not read_only:
             self._conn.executescript(SCHEMA)
@@ -199,111 +164,106 @@ class ShardMap:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> "ShardMap":
+    def __enter__(self):
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(self, *exc):
         self.close()
 
-    # -- metadata -------------------------------------------------------
-
     def get_meta(self, key: str, default: str | None = None) -> str | None:
-        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
+        self._conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, str(value)))
 
     @property
     def version(self) -> int:
-        """Monotonic version, bumped by every structural change."""
         return int(self.get_meta("version", "0") or 0)
 
     def _bump_version(self) -> int:
-        new = self.version + 1
-        self.set_meta("version", str(new))
+        value = self.version + 1
+        self.set_meta("version", value)
         self.set_meta("updated_at", f"{time.time():.6f}")
-        return new
+        return value
 
     @property
     def is_initialised(self) -> bool:
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()
+        row = self._conn.execute("SELECT COUNT(*) n FROM chunks").fetchone()
         return bool(row["n"])
 
-    # -- construction ---------------------------------------------------
-
-    def bootstrap(
-        self,
-        shards: Sequence[tuple[str, str, int]],
-        num_chunks: int,
-        shard_key: str = "_id",
-        force: bool = False,
-    ) -> ShardMapSnapshot:
-        """Create the initial chunk table, round-robin across the shards."""
+    def bootstrap(self, shards: Sequence[tuple[str, str, int]], num_chunks: int,
+                  shard_key: str = "_id", force: bool = False,
+                  followers: Sequence[tuple[str, str, int, str]] = ()) -> ShardMapSnapshot:
         if self.is_initialised and not force:
-            raise ShardMapError(
-                f"shard map {self.path} is already initialised (version {self.version})"
-            )
+            raise ShardMapError(f"shard map {self.path} is already initialised")
         if num_chunks < len(shards):
-            raise ShardMapError("num_chunks must be at least the number of shards")
+            raise ShardMapError("num_chunks must be at least the number of primaries")
         with self._conn:
             self._conn.execute("DELETE FROM chunks")
+            self._conn.execute("DELETE FROM replicas")
             self._conn.execute("DELETE FROM shards")
+            all_shards = list(shards) + [(fid, host, port) for fid, host, port, _ in followers]
             self._conn.executemany(
-                "INSERT INTO shards(shard_id, host, port, state) VALUES(?, ?, ?, 'online')",
-                shards,
-            )
+                "INSERT INTO shards(shard_id,host,port,state) VALUES(?,?,?,'online')",
+                all_shards)
+            self._conn.executemany(
+                "INSERT INTO replicas(primary_id,follower_id,active_id,epoch) VALUES(?,?,?,1)",
+                [(pid, fid, pid) for fid, _, _, pid in followers])
             ranges = even_ranges(num_chunks)
             self._conn.executemany(
-                "INSERT INTO chunks(chunk_id, lo, hi, owner, state) VALUES(?, ?, ?, ?, 'stable')",
-                [
-                    (i, lo, hi, shards[i % len(shards)][0])
-                    for i, (lo, hi) in enumerate(ranges)
-                ],
-            )
+                "INSERT INTO chunks(chunk_id,lo,hi,owner,state) VALUES(?,?,?,?,'stable')",
+                [(i, lo, hi, shards[i % len(shards)][0])
+                 for i, (lo, hi) in enumerate(ranges)])
             self.set_meta("shard_key", shard_key)
-            self.set_meta("hash_space", str(HASH_SPACE))
+            self.set_meta("hash_space", HASH_SPACE)
             self.set_meta("created_at", f"{time.time():.6f}")
             self.set_meta("version", "0")
             self._bump_version()
         return self.snapshot()
 
     def set_chunk_owner(self, chunk_id: int, owner: str, state: str = "stable") -> int:
-        """Reassign a chunk; returns the new map version (used by migration)."""
         with self._conn:
-            cur = self._conn.execute(
-                "UPDATE chunks SET owner = ?, state = ? WHERE chunk_id = ?",
-                (owner, state, chunk_id),
-            )
-            if cur.rowcount == 0:
+            cur = self._conn.execute("UPDATE chunks SET owner=?,state=? WHERE chunk_id=?",
+                                     (owner, state, chunk_id))
+            if not cur.rowcount:
                 raise ShardMapError(f"unknown chunk {chunk_id}")
             return self._bump_version()
 
-    # -- reading --------------------------------------------------------
+    def promote_follower(self, primary_id: str) -> tuple[str, int]:
+        """Atomically promote a follower and move all of its primary's chunks."""
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM replicas WHERE primary_id=?", (primary_id,)).fetchone()
+            if row is None:
+                raise ShardMapError(f"no follower registered for {primary_id}")
+            if row["active_id"] != primary_id:
+                raise ShardMapError(f"{primary_id} has already failed over")
+            follower_id = row["follower_id"]
+            new_epoch = int(row["epoch"]) + 1
+            self._conn.execute(
+                "UPDATE chunks SET owner=? WHERE owner=?", (follower_id, primary_id))
+            self._conn.execute(
+                "UPDATE replicas SET active_id=?,epoch=?,promoted_at=? WHERE primary_id=?",
+                (follower_id, new_epoch, time.time(), primary_id))
+            self._conn.execute("UPDATE shards SET state='offline' WHERE shard_id=?", (primary_id,))
+            self._conn.execute("UPDATE shards SET state='online' WHERE shard_id=?", (follower_id,))
+            self._bump_version()
+        return follower_id, new_epoch
 
     def snapshot(self) -> ShardMapSnapshot:
-        shards = [
-            ShardInfo(r["shard_id"], r["host"], r["port"], r["state"])
-            for r in self._conn.execute("SELECT * FROM shards ORDER BY shard_id")
-        ]
-        chunks = [
-            Chunk(r["chunk_id"], r["lo"], r["hi"], r["owner"], r["state"])
-            for r in self._conn.execute("SELECT * FROM chunks ORDER BY lo")
-        ]
-        return ShardMapSnapshot(self.version, self.get_meta("shard_key", "_id"), shards, chunks)
+        shards = [ShardInfo(r["shard_id"], r["host"], r["port"], r["state"])
+                  for r in self._conn.execute("SELECT * FROM shards ORDER BY shard_id")]
+        chunks = [Chunk(r["chunk_id"], r["lo"], r["hi"], r["owner"], r["state"])
+                  for r in self._conn.execute("SELECT * FROM chunks ORDER BY lo")]
+        replicas = [dict(r) for r in self._conn.execute("SELECT * FROM replicas")]
+        return ShardMapSnapshot(self.version, self.get_meta("shard_key", "_id"),
+                                shards, chunks, replicas)
 
 
 class ShardMapCache:
-    """Router-side cache that rebuilds its snapshot only when the version moves.
-
-    The version probe is a single indexed SQLite read, so routing stays cheap
-    while still noticing a chunk hand-over the moment it is committed.
-    """
-
     def __init__(self, path: str | Path) -> None:
         self._map = ShardMap(path, read_only=True)
         self._snapshot = self._map.snapshot()
