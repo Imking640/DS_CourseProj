@@ -1,4 +1,14 @@
-"""Query router with replica-aware routing and automatic follower promotion."""
+"""Query router with replica-aware routing and automatic follower promotion.
+
+Phase 3 adds two migration-aware behaviours:
+
+* every scatter-gather read carries the hash ranges each target currently
+  owns, so a donor and a recipient that both physically hold a moving chunk
+  still return it exactly once; and
+* a shard that answers "this range is migrating" causes the router to reload
+  the shard map, re-plan and retry, which is how in-flight requests follow a
+  chunk across the cutover instead of failing.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +28,15 @@ from .shardmap import ShardInfo, ShardMap, ShardMapCache, ShardMapError
 from .routing import RoutePlan, merge_results, plan_for_filter, plan_for_key, shard_limit
 
 DEFAULT_TIMEOUT = 10.0
+
+# Must match shardstore.shard_node.MIGRATION_RETRY.
+MIGRATION_RETRY = "range is migrating; reload the shard map and retry"
+MIGRATION_RETRIES = 8
+MIGRATION_BACKOFF_S = 0.05
+
+
+def is_migration_retry(exc: HTTPException) -> bool:
+    return exc.status_code == 409 and MIGRATION_RETRY in str(exc.detail)
 
 
 class ShardUnavailable(HTTPException):
@@ -47,6 +66,34 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
 
     def snapshot():
         return cache.snapshot
+
+    def owned_ranges_of(shard_id: str, snap=None) -> list[tuple[int, int]]:
+        """Hash ranges ``shard_id`` owns in the current map, coalesced."""
+        snap = snap or snapshot()
+        spans = sorted((c.lo, c.hi) for c in snap.chunks_of(shard_id))
+        merged: list[tuple[int, int]] = []
+        for lo, hi in spans:
+            if merged and merged[-1][1] == lo:
+                merged[-1] = (merged[-1][0], hi)
+            else:
+                merged.append((lo, hi))
+        return merged
+
+    async def with_migration_retry(attempt):
+        """Run ``attempt``, re-planning whenever a shard reports a moving range.
+
+        ``attempt`` is re-invoked from scratch so it re-reads the shard map,
+        which is what lets a request that started before a cutover finish at
+        the chunk's new owner.
+        """
+        for retry in range(MIGRATION_RETRIES):
+            try:
+                return await attempt()
+            except HTTPException as exc:
+                if not is_migration_retry(exc) or retry == MIGRATION_RETRIES - 1:
+                    raise
+                await asyncio.sleep(MIGRATION_BACKOFF_S * (retry + 1))
+        raise HTTPException(status_code=503, detail="chunk migration did not settle")
 
     async def promote_if_needed(primary_id: str) -> bool:
         """Promote the registered follower once; shard-map update is atomic."""
@@ -162,9 +209,22 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
         return info
 
     async def fan_out(plan: RoutePlan, path: str, json_body: Any | None = None,
-                      method: str = "POST"):
+                      method: str = "POST", per_target: bool = False):
+        """Issue the request to every shard in the plan, concurrently.
+
+        With ``per_target`` each shard is told which hash ranges it owns, so a
+        donor and a recipient mid-migration cannot both return the same
+        document.
+        """
+        snap = snapshot()
+
+        def body_for(shard: ShardInfo):
+            if not per_target or not isinstance(json_body, dict):
+                return json_body
+            return {**json_body, "owned_ranges": owned_ranges_of(shard.shard_id, snap)}
+
         results = await asyncio.gather(
-            *(call(shard, method, path, json_body) for shard in plan.targets))
+            *(call(shard, method, path, body_for(shard)) for shard in plan.targets))
         payloads = [payload for payload, _ in results]
         timings = {payload.get("shard_id", shard.shard_id): round(elapsed, 3)
                    for shard, (payload, elapsed) in zip(plan.targets, results)}
@@ -219,61 +279,80 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
         if snap.shard_key not in req.document:
             raise HTTPException(status_code=400,
                                 detail=f"document is missing shard key {snap.shard_key!r}")
-        plan = plan_for_key(snap, req.document[snap.shard_key])
-        payload, elapsed = await call(plan.targets[0], "POST", "/documents",
-                                      {"document": req.document})
-        return {"routing": actual_route_info(plan, [payload]), "inserted": True,
-                "document": payload["document"], "took_ms": round(elapsed, 3)}
+        async def attempt():
+            plan = plan_for_key(snapshot(), req.document[snap.shard_key])
+            payload, elapsed = await call(plan.targets[0], "POST", "/documents",
+                                          {"document": req.document})
+            return {"routing": actual_route_info(plan, [payload]), "inserted": True,
+                    "document": payload["document"], "took_ms": round(elapsed, 3)}
+
+        return await with_migration_retry(attempt)
 
     @app.post("/documents/bulk", status_code=201)
     async def insert_many(req: BulkInsertRequest):
-        snap = snapshot()
-        batches: dict[str, tuple[ShardInfo, list[dict[str, Any]]]] = {}
         for doc in req.documents:
-            if snap.shard_key not in doc:
-                raise HTTPException(status_code=400,
-                                    detail=f"document is missing shard key {snap.shard_key!r}")
-            shard = snap.shard_for_key(doc[snap.shard_key])
-            batches.setdefault(shard.shard_id, (shard, []))[1].append(doc)
+            if snapshot().shard_key not in doc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"document is missing shard key {snapshot().shard_key!r}")
         t0 = time.perf_counter()
-        results = await asyncio.gather(*(
-            call(shard, "POST", "/documents/bulk",
-                 {"documents": docs, "overwrite": req.overwrite})
-            for shard, docs in batches.values()))
-        return {"routing": {"mode": "grouped-write",
-                             "shards": [p["shard_id"] for p, _ in results],
-                             "map_version": snapshot().version,
-                             "fanout": len(results)},
-                "inserted": sum(p["inserted"] for p, _ in results),
-                "per_shard": {sid: len(docs) for sid, (_, docs) in batches.items()},
-                "took_ms": round((time.perf_counter()-t0)*1000, 3)}
+
+        async def attempt():
+            snap = snapshot()
+            batches: dict[str, tuple[ShardInfo, list[dict[str, Any]]]] = {}
+            for doc in req.documents:
+                shard = snap.shard_for_key(doc[snap.shard_key])
+                batches.setdefault(shard.shard_id, (shard, []))[1].append(doc)
+            results = await asyncio.gather(*(
+                call(shard, "POST", "/documents/bulk",
+                     {"documents": docs, "overwrite": req.overwrite})
+                for shard, docs in batches.values()))
+            return {"routing": {"mode": "grouped-write",
+                                "shards": [p["shard_id"] for p, _ in results],
+                                "map_version": snapshot().version,
+                                "fanout": len(results)},
+                    "inserted": sum(p["inserted"] for p, _ in results),
+                    "per_shard": {sid: len(docs) for sid, (_, docs) in batches.items()},
+                    "took_ms": round((time.perf_counter()-t0)*1000, 3)}
+
+        return await with_migration_retry(attempt)
 
     @app.put("/documents/{doc_id}")
     async def update(doc_id: str, req: UpdateRequest):
-        plan = plan_for_key(snapshot(), doc_id)
-        payload, elapsed = await call(plan.targets[0], "PUT", f"/documents/{doc_id}",
-                                      req.model_dump())
-        return {"routing": actual_route_info(plan, [payload]), "matched": payload["matched"],
-                "upserted": payload["upserted"], "document": payload["document"],
-                "took_ms": round(elapsed, 3)}
+        async def attempt():
+            plan = plan_for_key(snapshot(), doc_id)
+            payload, elapsed = await call(plan.targets[0], "PUT", f"/documents/{doc_id}",
+                                          req.model_dump())
+            return {"routing": actual_route_info(plan, [payload]),
+                    "matched": payload["matched"], "upserted": payload["upserted"],
+                    "document": payload["document"], "took_ms": round(elapsed, 3)}
+
+        return await with_migration_retry(attempt)
 
     @app.delete("/documents/{doc_id}")
     async def delete(doc_id: str):
-        plan = plan_for_key(snapshot(), doc_id)
-        payload, elapsed = await call(plan.targets[0], "DELETE", f"/documents/{doc_id}")
-        return {"routing": actual_route_info(plan, [payload]), "deleted": payload["deleted"],
-                "took_ms": round(elapsed, 3)}
+        async def attempt():
+            plan = plan_for_key(snapshot(), doc_id)
+            payload, elapsed = await call(plan.targets[0], "DELETE",
+                                          f"/documents/{doc_id}")
+            return {"routing": actual_route_info(plan, [payload]),
+                    "deleted": payload["deleted"], "took_ms": round(elapsed, 3)}
+
+        return await with_migration_retry(attempt)
 
     @app.get("/documents/{doc_id}")
     async def get(doc_id: str, read_preference: str = "primary"):
         if read_preference not in ("primary", "follower"):
             raise HTTPException(status_code=400, detail="read_preference must be primary or follower")
-        plan = plan_for_key(snapshot(), doc_id)
-        # GET document reads use the same preference resolver as query reads.
-        payload, elapsed = await call(plan.targets[0], "GET", f"/documents/{doc_id}",
-                                      {"read_preference": read_preference})
-        return {"routing": actual_route_info(plan, [payload], read_preference), "document": payload["document"],
-                "took_ms": round(elapsed, 3)}
+        async def attempt():
+            plan = plan_for_key(snapshot(), doc_id)
+            # GET document reads use the same preference resolver as query reads.
+            payload, elapsed = await call(plan.targets[0], "GET", f"/documents/{doc_id}",
+                                          {"read_preference": read_preference})
+            return {"routing": actual_route_info(plan, [payload], read_preference),
+                    "document": payload["document"], "took_ms": round(elapsed, 3)}
+
+        return await with_migration_retry(attempt)
 
     @app.post("/query", response_model=RouterQueryResponse)
     async def query(req: QueryRequest):
@@ -283,18 +362,25 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
         except FilterError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         t0 = time.perf_counter()
-        plan = plan_for_filter(snapshot(), req.filter)
-        per_shard_req = req.model_dump()
-        per_shard_req["limit"] = shard_limit(req.limit, req.skip, plan.fanout)
-        per_shard_req["skip"] = 0 if plan.fanout > 1 else req.skip
-        payloads, timings = await fan_out(plan, "/query", per_shard_req)
-        documents = merge_results([p["documents"] for p in payloads], order,
-                                  limit=req.limit,
-                                  skip=req.skip if plan.fanout > 1 else 0)
-        return RouterQueryResponse(
-            routing=RoutingInfo(**actual_route_info(plan, payloads, req.read_preference)), count=len(documents),
-            documents=documents, examined=sum(p["examined"] for p in payloads),
-            took_ms=round((time.perf_counter()-t0)*1000, 3), per_shard_ms=timings)
+
+        async def attempt():
+            plan = plan_for_filter(snapshot(), req.filter)
+            per_shard_req = req.model_dump()
+            per_shard_req["limit"] = shard_limit(req.limit, req.skip, plan.fanout)
+            per_shard_req["skip"] = 0 if plan.fanout > 1 else req.skip
+            payloads, timings = await fan_out(plan, "/query", per_shard_req,
+                                              per_target=True)
+            documents = merge_results([p["documents"] for p in payloads], order,
+                                      limit=req.limit,
+                                      skip=req.skip if plan.fanout > 1 else 0)
+            return RouterQueryResponse(
+                routing=RoutingInfo(**actual_route_info(plan, payloads,
+                                                        req.read_preference)),
+                count=len(documents), documents=documents,
+                examined=sum(p["examined"] for p in payloads),
+                took_ms=round((time.perf_counter()-t0)*1000, 3), per_shard_ms=timings)
+
+        return await with_migration_retry(attempt)
 
     @app.post("/count")
     async def count(req: CountRequest):
@@ -303,11 +389,18 @@ def create_app(shard_map_path: str, timeout: float = DEFAULT_TIMEOUT) -> FastAPI
         except FilterError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         t0 = time.perf_counter()
-        plan = plan_for_filter(snapshot(), req.filter)
-        payloads, timings = await fan_out(plan, "/count", req.model_dump())
-        return {"routing": actual_route_info(plan, payloads, req.read_preference), "count": sum(p["count"] for p in payloads),
-                "per_shard": {p["shard_id"]: p["count"] for p in payloads},
-                "per_shard_ms": timings, "took_ms": round((time.perf_counter()-t0)*1000, 3)}
+
+        async def attempt():
+            plan = plan_for_filter(snapshot(), req.filter)
+            payloads, timings = await fan_out(plan, "/count", req.model_dump(),
+                                              per_target=True)
+            return {"routing": actual_route_info(plan, payloads, req.read_preference),
+                    "count": sum(p["count"] for p in payloads),
+                    "per_shard": {p["shard_id"]: p["count"] for p in payloads},
+                    "per_shard_ms": timings,
+                    "took_ms": round((time.perf_counter()-t0)*1000, 3)}
+
+        return await with_migration_retry(attempt)
 
     return app
 

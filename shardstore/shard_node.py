@@ -1,4 +1,11 @@
-"""A shard process. Primaries synchronously replicate acknowledged writes."""
+"""A shard process. Primaries synchronously replicate acknowledged writes.
+
+Phase 3 adds the donor and recipient halves of a chunk migration.  A donor
+arms the moving range (capturing concurrent writes), ships a snapshot, then
+freezes the range for the brief cutover; a recipient ingests shipped batches
+through the same replication path as any other write, so its follower ends up
+with the moved documents too.
+"""
 from __future__ import annotations
 
 import os
@@ -11,10 +18,18 @@ from typing import Any, AsyncIterator
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Response
 
-from .api_models import (BulkInsertRequest, CountRequest, InsertRequest,
-                         QueryRequest, ShardQueryResponse, UpdateRequest)
+from .api_models import (ArmRangeRequest, BulkInsertRequest, CountRequest,
+                         InsertRequest, MigrationCommitRequest,
+                         MigrationIngestRequest, QueryRequest,
+                         ShardQueryResponse, UpdateRequest)
 from .filters import FilterError
-from .storage import DocumentNotFound, DocumentStore, DuplicateKeyError
+from .hashing import hash_key
+from .storage import (DocumentNotFound, DocumentStore, DuplicateKeyError,
+                      in_any_range)
+
+# The router recognises this marker, reloads the shard map and retries
+# elsewhere.  409 is used so an ordinary client sees a conflict, not a crash.
+MIGRATION_RETRY = "range is migrating; reload the shard map and retry"
 
 
 def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
@@ -22,6 +37,13 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
                shard_map_path: str | None = None, initial_epoch: int = 1) -> FastAPI:
     store = DocumentStore(db_path, shard_key=shard_key)
     started = time.time()
+    # Ranges this node has handed over but may still physically hold, and the
+    # range (if any) currently frozen for a cutover.  Both make this node
+    # refuse key-routed traffic it no longer owns, so a client holding a stale
+    # shard map is told to re-route instead of being served stale data.
+    donated_ranges: list[tuple[int, int]] = []
+    frozen_ranges: dict[str, tuple[int, int]] = {}
+    migrations: dict[str, dict[str, Any]] = {}
     state_db = sqlite3.connect(str(db_path) + ".node-state.db", check_same_thread=False)
     state_db.execute("CREATE TABLE IF NOT EXISTS node_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     state_db.execute("INSERT OR IGNORE INTO node_state VALUES('role', ?)", (role,))
@@ -64,6 +86,20 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
             finally:
                 conn.close()
 
+    def guard_migration(doc_id: str, writing: bool) -> None:
+        """Refuse a key-routed request for a range this node must not serve.
+
+        A frozen range is mid-cutover: writes are refused so the donor's final
+        state is quiescent while the last changes ship, but reads still work
+        because the donor's copy is still authoritative.  A donated range has
+        already been handed over, so both reads and writes are redirected.
+        """
+        key = hash_key(doc_id)
+        if in_any_range(key, donated_ranges):
+            raise HTTPException(status_code=409, detail=MIGRATION_RETRY)
+        if writing and in_any_range(key, list(frozen_ranges.values())):
+            raise HTTPException(status_code=409, detail=MIGRATION_RETRY)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
@@ -105,6 +141,10 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
                 return {"matched": not created, "upserted": created, "document": doc}
             if operation == "delete":
                 return {"deleted": int(store.delete(payload["doc_id"]))}
+            if operation == "migrate":
+                upserted, deleted = store.apply_migration_batch(
+                    payload.get("documents", []), payload.get("deletes", []))
+                return {"upserted": upserted, "deleted": deleted}
             raise HTTPException(status_code=400, detail=f"unknown replication operation {operation}")
         except DuplicateKeyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -170,9 +210,110 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
             raise HTTPException(status_code=503, detail=f"follower sync failed: {exc}") from exc
         return {"synchronised": len(docs), "follower": partner_url}
 
+    # -- migration: donor side ------------------------------------------
+
+    @app.post("/internal/migration/arm")
+    def migration_arm(req: ArmRangeRequest):
+        """Begin capturing writes to ``[lo, hi)`` before the copy starts."""
+        if state("role") != "primary":
+            raise HTTPException(status_code=409, detail="only a primary can donate a range")
+        in_range = store.arm_range(req.migration_id, req.lo, req.hi)
+        migrations[req.migration_id] = {"lo": req.lo, "hi": req.hi, "phase": "armed"}
+        return {"shard_id": shard_id, "migration_id": req.migration_id,
+                "documents_in_range": in_range, "epoch": int(state("epoch"))}
+
+    @app.get("/internal/migration/changes")
+    def migration_changes(migration_id: str, since_seq: int = 0, limit: int = 500):
+        """Mutations captured since ``since_seq``, oldest first."""
+        changes = store.changes_since(migration_id, since_seq, limit)
+        return {"shard_id": shard_id, "migration_id": migration_id,
+                "changes": [{"seq": c.seq, "doc_id": c.doc_id, "op": c.op,
+                             "document": c.document} for c in changes],
+                "last_seq": changes[-1].seq if changes else since_seq,
+                "remaining": store.pending_changes(
+                    migration_id, changes[-1].seq if changes else since_seq)}
+
+    @app.post("/internal/migration/freeze")
+    def migration_freeze(req: MigrationCommitRequest):
+        """Enter the cutover critical section: refuse writes to the range."""
+        record = migrations.get(req.migration_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown migration")
+        frozen_ranges[req.migration_id] = (record["lo"], record["hi"])
+        record["phase"] = "frozen"
+        return {"shard_id": shard_id, "frozen": [record["lo"], record["hi"]],
+                "pending_changes": store.pending_changes(req.migration_id, 0)}
+
+    @app.post("/internal/migration/commit")
+    def migration_commit(req: MigrationCommitRequest):
+        """Finish: stop serving the range and drop the donor's copy."""
+        record = migrations.get(req.migration_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown migration")
+        span = (record["lo"], record["hi"])
+        donated_ranges.append(span)
+        frozen_ranges.pop(req.migration_id, None)
+        removed = store.delete_range(*span) if req.delete_range else 0
+        store.disarm_range(req.migration_id)
+        record["phase"] = "committed"
+        return {"shard_id": shard_id, "migration_id": req.migration_id,
+                "removed": removed, "donated": list(span)}
+
+    @app.post("/internal/migration/abort")
+    def migration_abort(req: MigrationCommitRequest):
+        """Give up: unfreeze and keep serving the range as before."""
+        frozen_ranges.pop(req.migration_id, None)
+        store.disarm_range(req.migration_id)
+        record = migrations.pop(req.migration_id, None)
+        return {"shard_id": shard_id, "aborted": req.migration_id,
+                "phase_reached": record["phase"] if record else None}
+
+    @app.get("/internal/migration/digest")
+    def migration_digest(lo: int, hi: int):
+        """Fingerprint of a range, so a move can be verified end to end."""
+        return {"shard_id": shard_id, **store.range_digest(lo, hi)}
+
+    @app.get("/internal/migration/state")
+    def migration_state():
+        return {"shard_id": shard_id, "armed": store.armed_range,
+                "frozen": {k: list(v) for k, v in frozen_ranges.items()},
+                "donated": [list(r) for r in donated_ranges],
+                "migrations": migrations}
+
+    # -- migration: recipient side ---------------------------------------
+
+    @app.post("/internal/migration/ingest")
+    async def migration_ingest(req: MigrationIngestRequest,
+                               x_ownership_epoch: int = Header(default=1)):
+        """Apply a shipped batch here and on this node's follower.
+
+        Routed through the ordinary replication path, which is what makes the
+        recipient's follower receive the moved documents as well.
+        """
+        validate_epoch(x_ownership_epoch)
+        upserted, deleted = store.apply_migration_batch(req.documents, req.deletes)
+        await replicate("migrate",
+                        {"documents": req.documents, "deletes": req.deletes},
+                        x_ownership_epoch)
+        return {"shard_id": shard_id, "upserted": upserted, "deleted": deleted,
+                "migration_id": req.migration_id}
+
+    @app.post("/internal/migration/accept")
+    def migration_accept(req: ArmRangeRequest):
+        """Take a range back: clear it from this node's donated list.
+
+        Needed when a range is migrated away and later migrated back, which
+        would otherwise keep being refused by :func:`guard_migration`.
+        """
+        donated_ranges[:] = [r for r in donated_ranges
+                             if r[1] <= req.lo or r[0] >= req.hi]
+        return {"shard_id": shard_id, "accepted": [req.lo, req.hi],
+                "donated": [list(r) for r in donated_ranges]}
+
     @app.post("/documents", status_code=201)
     async def insert(req: InsertRequest, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
+        guard_migration(str(req.document.get(shard_key, "")), writing=True)
         try:
             doc = store.insert(req.document)
         except DuplicateKeyError as exc:
@@ -186,6 +327,8 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.post("/documents/bulk", status_code=201)
     async def insert_many(req: BulkInsertRequest, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
+        for doc in req.documents:
+            guard_migration(str(doc.get(shard_key, "")), writing=True)
         try:
             n = store.insert_many(req.documents, overwrite=req.overwrite)
         except DuplicateKeyError as exc:
@@ -199,6 +342,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     async def update(doc_id: str, req: UpdateRequest,
                      x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
+        guard_migration(doc_id, writing=True)
         try:
             doc, created = store.update(doc_id, req.update, upsert=req.upsert)
         except DocumentNotFound as exc:
@@ -212,6 +356,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.delete("/documents/{doc_id}")
     async def delete(doc_id: str, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
+        guard_migration(doc_id, writing=True)
         if not store.delete(doc_id):
             raise HTTPException(status_code=404, detail=f"no document with _id {doc_id!r}")
         await replicate("delete", {"doc_id": doc_id}, x_ownership_epoch)
@@ -219,6 +364,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
 
     @app.get("/documents/{doc_id}")
     def get(doc_id: str):
+        guard_migration(doc_id, writing=False)
         doc = store.get(doc_id)
         if doc is None:
             raise HTTPException(status_code=404, detail=f"no document with _id {doc_id!r}")
@@ -231,7 +377,8 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
         try:
             result = store.query(req.filter, sort=req.sort, limit=req.limit,
                                  skip=req.skip, fields=req.fields,
-                                 hash_range=req.hash_range)
+                                 hash_range=req.hash_range,
+                                 owned_ranges=req.owned_ranges)
         except FilterError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return ShardQueryResponse(shard_id=shard_id, count=len(result.documents),
@@ -242,7 +389,8 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.post("/count")
     def count(req: CountRequest):
         try:
-            n = store.count(req.filter, hash_range=req.hash_range)
+            n = store.count(req.filter, hash_range=req.hash_range,
+                            owned_ranges=req.owned_ranges)
         except FilterError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"shard_id": shard_id, "count": n}

@@ -433,8 +433,16 @@ class DocumentStore:
         Arming and counting happen under one lock, so a write either lands
         before the count (and is in the snapshot the recipient clones) or
         after it (and is in the changelog).  Nothing can fall between.
+
+        Only one range may be armed at a time: a second concurrent donation
+        from the same shard is refused rather than silently losing capture.
         """
         with self._lock, self._conn:
+            if self._armed is not None and self._armed[0] != migration_id:
+                raise StorageError(
+                    f"shard is already donating range {self._armed[1:]} "
+                    f"for migration {self._armed[0]!r}"
+                )
             self._conn.execute("DELETE FROM migration_log WHERE migration_id = ?",
                                (migration_id,))
             self._armed = (migration_id, lo, hi)
