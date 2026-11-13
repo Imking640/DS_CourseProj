@@ -3,11 +3,22 @@
 One table holds the documents of the one logical collection.  Alongside the
 JSON body we persist ``key_hash`` -- the hash of the document's shard key --
 so a shard can scan, count or hand over exactly the documents of one chunk
-range without re-hashing every row (used by the Phase 3 migration).
+range without re-hashing every row.
+
+Two Phase 3 facilities live here:
+
+* **Owned-range filtering.**  A query may be restricted to the hash ranges the
+  caller believes this shard owns.  During a migration both the donor and the
+  recipient physically hold the moving documents, so without this filter a
+  scatter-gather would return each of them twice.
+* **The migration changelog.**  While a range is *armed*, every mutation that
+  lands in it is appended to ``migration_log``, which is how writes accepted
+  during the copy are carried over to the recipient.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -20,7 +31,7 @@ from .filters import (
     FilterError, apply_sort, extract_shard_keys, matches, normalise_sort, project,
     validate_filter,
 )
-from .hashing import hash_key
+from .hashing import canonical, hash_key
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -32,6 +43,18 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE INDEX IF NOT EXISTS documents_by_hash ON documents(key_hash);
+
+CREATE TABLE IF NOT EXISTS migration_log (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    migration_id TEXT    NOT NULL,
+    doc_id       TEXT    NOT NULL,
+    key_hash     INTEGER NOT NULL,
+    op           TEXT    NOT NULL,   -- 'upsert' or 'delete'
+    body         TEXT,               -- NULL for a delete
+    logged_at    REAL    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS migration_log_by_id ON migration_log(migration_id, seq);
 """
 
 UPDATE_OPS = {"$set", "$unset", "$inc", "$mul", "$push", "$pull"}
@@ -56,6 +79,32 @@ class ScanResult:
     documents: list[dict[str, Any]]
     examined: int
     indexed: bool
+
+
+@dataclass(slots=True)
+class LoggedChange:
+    """One mutation captured in an armed range while a migration was running."""
+
+    seq: int
+    doc_id: str
+    op: str
+    document: dict[str, Any] | None
+
+
+Range = tuple[int, int]
+
+
+def _range_clause(ranges: Sequence[Range], column: str = "key_hash") -> tuple[str, list[Any]]:
+    """SQL matching ``column`` against a union of half-open ``[lo, hi)`` ranges."""
+    parts = " OR ".join(f"({column} >= ? AND {column} < ?)" for _ in ranges)
+    params: list[Any] = []
+    for lo, hi in ranges:
+        params.extend((lo, hi))
+    return f"({parts})", params
+
+
+def in_any_range(key_hash: int, ranges: Sequence[Range]) -> bool:
+    return any(lo <= key_hash < hi for lo, hi in ranges)
 
 
 # -- update operators --------------------------------------------------
@@ -149,6 +198,8 @@ class DocumentStore:
         self.shard_key = shard_key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # (migration_id, lo, hi) while a range is armed for migration capture.
+        self._armed: tuple[str, int, int] | None = None
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -173,13 +224,33 @@ class DocumentStore:
 
     def _write(self, doc: dict[str, Any], version: int) -> None:
         doc_id = str(self.shard_key_of(doc))
+        key_hash = hash_key(self.shard_key_of(doc))
+        body = json.dumps(doc)
         self._conn.execute(
             "INSERT INTO documents(doc_id, key_hash, body, version, updated_at) "
             "VALUES(?, ?, ?, ?, ?) "
             "ON CONFLICT(doc_id) DO UPDATE SET "
             "  body = excluded.body, version = excluded.version, "
             "  updated_at = excluded.updated_at",
-            (doc_id, hash_key(self.shard_key_of(doc)), json.dumps(doc), version, time.time()),
+            (doc_id, key_hash, body, version, time.time()),
+        )
+        self._log_change(doc_id, key_hash, "upsert", body)
+
+    def _log_change(self, doc_id: str, key_hash: int, op: str, body: str | None) -> None:
+        """Record a mutation if it lands in the range armed for migration.
+
+        Called with the store lock held and inside the caller's transaction, so
+        a logged change and the write it describes commit together.
+        """
+        if self._armed is None:
+            return
+        migration_id, lo, hi = self._armed
+        if not lo <= key_hash < hi:
+            return
+        self._conn.execute(
+            "INSERT INTO migration_log(migration_id, doc_id, key_hash, op, body, logged_at) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (migration_id, doc_id, key_hash, op, body, time.time()),
         )
 
     # -- writes ---------------------------------------------------------
@@ -245,8 +316,14 @@ class DocumentStore:
 
     def delete(self, doc_id: str) -> bool:
         with self._lock, self._conn:
-            cur = self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
-            return cur.rowcount > 0
+            row = self._conn.execute(
+                "SELECT key_hash FROM documents WHERE doc_id = ?", (doc_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            self._log_change(doc_id, row["key_hash"], "delete", None)
+            return True
 
     def delete_range(self, lo: int, hi: int) -> int:
         """Drop every document whose shard key hashes into ``[lo, hi)``."""
@@ -269,13 +346,14 @@ class DocumentStore:
         self,
         filt: dict[str, Any] | None,
         hash_range: tuple[int, int] | None,
+        owned_ranges: Sequence[Range] | None = None,
     ) -> tuple[list[sqlite3.Row], bool]:
         """Rows that could match, plus whether an index was used.
 
         A filter that pins the shard key becomes a primary-key lookup, so a
         directly routed query costs an index seek rather than a full scan of
-        the shard.  Anything else falls back to scanning (optionally limited
-        to one chunk's hash range).
+        the shard.  Anything else falls back to scanning, optionally limited
+        to one chunk's hash range and to the ranges this shard still owns.
         """
         keys = extract_shard_keys(filt, self.shard_key)
         clauses: list[str] = []
@@ -290,6 +368,12 @@ class DocumentStore:
         if hash_range is not None:
             clauses.append("key_hash >= ? AND key_hash < ?")
             params.extend(hash_range)
+        if owned_ranges is not None:
+            if not owned_ranges:
+                return [], indexed          # owns nothing, so matches nothing
+            clause, range_params = _range_clause(owned_ranges)
+            clauses.append(clause)
+            params.extend(range_params)
 
         sql = "SELECT body FROM documents"
         if clauses:
@@ -305,11 +389,12 @@ class DocumentStore:
         skip: int = 0,
         fields: Sequence[str] | None = None,
         hash_range: tuple[int, int] | None = None,
+        owned_ranges: Sequence[Range] | None = None,
     ) -> ScanResult:
         """Filter-query this shard; ``limit`` is applied after sorting."""
         validate_filter(filt)
         order = normalise_sort(sort)
-        rows, indexed = self._candidates(filt, hash_range)
+        rows, indexed = self._candidates(filt, hash_range, owned_ranges)
         docs = [json.loads(r["body"]) for r in rows]
         matched = [d for d in docs if matches(d, filt)]
         matched = apply_sort(matched, order)
@@ -331,13 +416,99 @@ class DocumentStore:
         self,
         filt: dict[str, Any] | None = None,
         hash_range: tuple[int, int] | None = None,
+        owned_ranges: Sequence[Range] | None = None,
     ) -> int:
         validate_filter(filt)
-        if not filt and hash_range is None:
+        if not filt and hash_range is None and owned_ranges is None:
             with self._lock:
                 return self._conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-        rows, _ = self._candidates(filt, hash_range)
+        rows, _ = self._candidates(filt, hash_range, owned_ranges)
         return sum(1 for r in rows if matches(json.loads(r["body"]), filt))
+
+    # -- migration support ----------------------------------------------
+
+    def arm_range(self, migration_id: str, lo: int, hi: int) -> int:
+        """Start capturing mutations in ``[lo, hi)``; returns docs in range.
+
+        Arming and counting happen under one lock, so a write either lands
+        before the count (and is in the snapshot the recipient clones) or
+        after it (and is in the changelog).  Nothing can fall between.
+        """
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM migration_log WHERE migration_id = ?",
+                               (migration_id,))
+            self._armed = (migration_id, lo, hi)
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM documents WHERE key_hash >= ? AND key_hash < ?",
+                (lo, hi),
+            ).fetchone()
+        return row["n"]
+
+    def disarm_range(self, migration_id: str) -> None:
+        with self._lock, self._conn:
+            if self._armed and self._armed[0] == migration_id:
+                self._armed = None
+            self._conn.execute("DELETE FROM migration_log WHERE migration_id = ?",
+                               (migration_id,))
+
+    @property
+    def armed_range(self) -> tuple[str, int, int] | None:
+        return self._armed
+
+    def changes_since(self, migration_id: str, since_seq: int,
+                      limit: int = 500) -> list[LoggedChange]:
+        """Mutations captured after ``since_seq``, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT seq, doc_id, op, body FROM migration_log "
+                "WHERE migration_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+                (migration_id, since_seq, limit),
+            ).fetchall()
+        return [
+            LoggedChange(r["seq"], r["doc_id"], r["op"],
+                         json.loads(r["body"]) if r["body"] else None)
+            for r in rows
+        ]
+
+    def pending_changes(self, migration_id: str, since_seq: int) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) AS n FROM migration_log WHERE migration_id = ? AND seq > ?",
+                (migration_id, since_seq),
+            ).fetchone()["n"]
+
+    def apply_migration_batch(
+        self,
+        documents: Sequence[dict[str, Any]] = (),
+        deletes: Sequence[str] = (),
+    ) -> tuple[int, int]:
+        """Idempotently apply a shipped batch; returns ``(upserted, deleted)``.
+
+        Upserts overwrite by ``_id`` and deletes ignore absent documents, so
+        replaying a batch after a retry cannot duplicate or lose anything.
+        """
+        with self._lock, self._conn:
+            for doc in documents:
+                self._write(doc, version=1)
+            removed = 0
+            for doc_id in deletes:
+                cur = self._conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                removed += cur.rowcount
+        return len(documents), removed
+
+    def range_digest(self, lo: int, hi: int) -> dict[str, Any]:
+        """Cheap fingerprint of a range, used to verify a completed move."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT doc_id, body FROM documents "
+                "WHERE key_hash >= ? AND key_hash < ? ORDER BY doc_id",
+                (lo, hi),
+            ).fetchall()
+        digest = hashlib.md5()
+        for row in rows:
+            digest.update(row["doc_id"].encode())
+            digest.update(canonical(json.loads(row["body"])).encode())
+        return {"documents": len(rows), "digest": digest.hexdigest()}
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
