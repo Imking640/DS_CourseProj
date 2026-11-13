@@ -72,6 +72,17 @@ class DocumentNotFound(StorageError):
     """Raised when a targeted update or delete matches nothing."""
 
 
+class RangeNotOwned(StorageError):
+    """Raised when a write targets a range this shard must no longer accept.
+
+    Checked while holding the store lock, so a write either completes (and is
+    captured in the migration changelog) or is refused.  Checking at the HTTP
+    layer instead would leave a window where a write passes the check, the
+    range is frozen and drained, and the write then lands in a range that is
+    about to be dropped -- an acknowledged write silently lost.
+    """
+
+
 @dataclass(slots=True)
 class ScanResult:
     """Documents plus how they were found -- reported back by the router."""
@@ -200,6 +211,8 @@ class DocumentStore:
         self._lock = threading.Lock()
         # (migration_id, lo, hi) while a range is armed for migration capture.
         self._armed: tuple[str, int, int] | None = None
+        # Ranges whose writes must be refused: frozen for cutover, or donated.
+        self._blocked: list[Range] = []
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -253,6 +266,25 @@ class DocumentStore:
             (migration_id, doc_id, key_hash, op, body, time.time()),
         )
 
+    def _check_writable(self, doc_id: str) -> None:
+        """Refuse a write into a blocked range.  Caller holds the lock."""
+        if self._blocked and in_any_range(hash_key(doc_id), self._blocked):
+            raise RangeNotOwned(f"this shard no longer accepts writes for {doc_id!r}")
+
+    def set_blocked_ranges(self, ranges: Sequence[Range]) -> None:
+        """Replace the set of ranges whose writes are refused.
+
+        Taking the store lock is what makes a cutover safe: once this returns,
+        every write still in flight has already committed (and been logged),
+        and every later write is rejected.
+        """
+        with self._lock:
+            self._blocked = list(ranges)
+
+    @property
+    def blocked_ranges(self) -> list[Range]:
+        return list(self._blocked)
+
     # -- writes ---------------------------------------------------------
 
     def insert(self, doc: dict[str, Any]) -> dict[str, Any]:
@@ -260,6 +292,7 @@ class DocumentStore:
             raise FilterError("document must be a JSON object")
         doc_id = str(self.shard_key_of(doc))
         with self._lock, self._conn:
+            self._check_writable(doc_id)
             exists = self._conn.execute(
                 "SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)
             ).fetchone()
@@ -280,6 +313,8 @@ class DocumentStore:
     def insert_many(self, docs: Iterable[dict[str, Any]], overwrite: bool = False) -> int:
         docs = list(docs)
         with self._lock, self._conn:
+            for doc in docs:
+                self._check_writable(str(self.shard_key_of(doc)))
             if not overwrite:
                 ids = [str(self.shard_key_of(d)) for d in docs]
                 placeholders = ",".join("?" * len(ids))
@@ -300,6 +335,7 @@ class DocumentStore:
     ) -> tuple[dict[str, Any], bool]:
         """Apply ``update`` to one document; returns ``(document, created)``."""
         with self._lock, self._conn:
+            self._check_writable(doc_id)
             row = self._conn.execute(
                 "SELECT * FROM documents WHERE doc_id = ?", (doc_id,)
             ).fetchone()
@@ -316,6 +352,7 @@ class DocumentStore:
 
     def delete(self, doc_id: str) -> bool:
         with self._lock, self._conn:
+            self._check_writable(doc_id)
             row = self._conn.execute(
                 "SELECT key_hash FROM documents WHERE doc_id = ?", (doc_id,)
             ).fetchone()

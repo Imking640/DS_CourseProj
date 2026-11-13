@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,7 +26,7 @@ from .api_models import (ArmRangeRequest, BulkInsertRequest, CountRequest,
 from .filters import FilterError
 from .hashing import hash_key
 from .storage import (DocumentNotFound, DocumentStore, DuplicateKeyError,
-                      in_any_range)
+                      RangeNotOwned, in_any_range)
 
 # The router recognises this marker, reloads the shard map and retries
 # elsewhere.  409 is used so an ordinary client sees a conflict, not a crash.
@@ -44,6 +45,11 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     donated_ranges: list[tuple[int, int]] = []
     frozen_ranges: dict[str, tuple[int, int]] = {}
     migrations: dict[str, dict[str, Any]] = {}
+    # Sync FastAPI endpoints run in a threadpool, so this connection is shared
+    # across threads and every use must be serialised: concurrent execute() on
+    # one sqlite3 connection interleaves cursor state, and a fetchone() can
+    # then come back empty for a row that exists.
+    state_lock = threading.Lock()
     state_db = sqlite3.connect(str(db_path) + ".node-state.db", check_same_thread=False)
     state_db.execute("CREATE TABLE IF NOT EXISTS node_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     state_db.execute("INSERT OR IGNORE INTO node_state VALUES('role', ?)", (role,))
@@ -57,11 +63,16 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
         partner_url = None
 
     def state(key: str) -> str:
-        row = state_db.execute("SELECT value FROM node_state WHERE key=?", (key,)).fetchone()
+        with state_lock:
+            row = state_db.execute(
+                "SELECT value FROM node_state WHERE key=?", (key,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=500,
+                                detail=f"node state {key!r} is missing")
         return row[0]
 
     def set_state(key: str, value: str) -> None:
-        with state_db:
+        with state_lock, state_db:
             state_db.execute("INSERT INTO node_state(key,value) VALUES(?,?) "
                              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                              (key, str(value)))
@@ -86,23 +97,36 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
             finally:
                 conn.close()
 
-    def guard_migration(doc_id: str, writing: bool) -> None:
-        """Refuse a key-routed request for a range this node must not serve.
+    def sync_blocked_ranges() -> None:
+        """Push the node's refused ranges down into the store.
 
-        A frozen range is mid-cutover: writes are refused so the donor's final
-        state is quiescent while the last changes ship, but reads still work
-        because the donor's copy is still authoritative.  A donated range has
-        already been handed over, so both reads and writes are redirected.
+        The store enforces them under its own lock, which is what closes the
+        window between an HTTP-level check and the write it guards.
         """
-        key = hash_key(doc_id)
-        if in_any_range(key, donated_ranges):
-            raise HTTPException(status_code=409, detail=MIGRATION_RETRY)
-        if writing and in_any_range(key, list(frozen_ranges.values())):
+        store.set_blocked_ranges(donated_ranges + list(frozen_ranges.values()))
+
+    def guard_migration(doc_id: str, writing: bool) -> None:
+        """Reject a *read* of a range this node has handed over.
+
+        Writes are enforced in the store (see :func:`sync_blocked_ranges`);
+        this only short-circuits reads, which the store does not block because
+        a donor's copy stays readable right up to the cutover.
+        """
+        if not writing and in_any_range(hash_key(doc_id), donated_ranges):
             raise HTTPException(status_code=409, detail=MIGRATION_RETRY)
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(inner: FastAPI) -> AsyncIterator[None]:
+        # One pooled client for the life of the process.  Building a client per
+        # write re-opened a connection to the follower every time, which under
+        # migration load exhausted sockets and turned acknowledged writes into
+        # "follower did not acknowledge" failures.
+        inner.state.replication_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
+        )
         yield
+        await inner.state.replication_client.aclose()
         store.close()
         state_db.close()
 
@@ -114,18 +138,23 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     def _bad_request(_request: Any, exc: FilterError) -> Response:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.exception_handler(RangeNotOwned)
+    def _moved(_request: Any, exc: RangeNotOwned) -> Response:
+        raise HTTPException(status_code=409, detail=MIGRATION_RETRY)
+
     async def replicate(operation: str, payload: dict[str, Any], epoch: int) -> None:
         if state("role") != "primary" or not partner_url:
             return
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.post(
-                    f"{partner_url}/internal/replicate",
-                    json={"operation": operation, "payload": payload, "epoch": epoch})
-                response.raise_for_status()
+            response = await app.state.replication_client.post(
+                f"{partner_url}/internal/replicate",
+                json={"operation": operation, "payload": payload, "epoch": epoch})
+            response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=503,
-                                detail=f"write applied locally but follower did not acknowledge: {exc}") from exc
+            raise HTTPException(
+                status_code=503,
+                detail=f"write applied locally but follower did not acknowledge: {exc}",
+            ) from exc
 
     def apply_replication(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -145,6 +174,8 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
                 upserted, deleted = store.apply_migration_batch(
                     payload.get("documents", []), payload.get("deletes", []))
                 return {"upserted": upserted, "deleted": deleted}
+            if operation == "drop_range":
+                return {"dropped": store.delete_range(payload["lo"], payload["hi"])}
             raise HTTPException(status_code=400, detail=f"unknown replication operation {operation}")
         except DuplicateKeyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -201,11 +232,11 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
             raise HTTPException(status_code=409, detail="this node has no active follower")
         docs = store.query(None).documents
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{partner_url}/internal/replace-all",
-                    json={"documents": docs, "epoch": int(state("epoch"))})
-                response.raise_for_status()
+            response = await app.state.replication_client.post(
+                f"{partner_url}/internal/replace-all",
+                json={"documents": docs, "epoch": int(state("epoch"))},
+                timeout=60.0)
+            response.raise_for_status()
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=503, detail=f"follower sync failed: {exc}") from exc
         return {"synchronised": len(docs), "follower": partner_url}
@@ -240,20 +271,31 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
         if record is None:
             raise HTTPException(status_code=404, detail="unknown migration")
         frozen_ranges[req.migration_id] = (record["lo"], record["hi"])
+        sync_blocked_ranges()
         record["phase"] = "frozen"
         return {"shard_id": shard_id, "frozen": [record["lo"], record["hi"]],
                 "pending_changes": store.pending_changes(req.migration_id, 0)}
 
     @app.post("/internal/migration/commit")
-    def migration_commit(req: MigrationCommitRequest):
-        """Finish: stop serving the range and drop the donor's copy."""
+    async def migration_commit(req: MigrationCommitRequest,
+                               x_ownership_epoch: int = Header(default=1)):
+        """Finish: stop serving the range and drop the donor's copy.
+
+        The drop is replicated, so the donor's follower sheds the handed-over
+        documents too and stays a faithful copy of its primary.
+        """
         record = migrations.get(req.migration_id)
         if record is None:
             raise HTTPException(status_code=404, detail="unknown migration")
         span = (record["lo"], record["hi"])
         donated_ranges.append(span)
         frozen_ranges.pop(req.migration_id, None)
-        removed = store.delete_range(*span) if req.delete_range else 0
+        sync_blocked_ranges()
+        removed = 0
+        if req.delete_range:
+            removed = store.delete_range(*span)
+            await replicate("drop_range", {"lo": span[0], "hi": span[1]},
+                            int(state("epoch")))
         store.disarm_range(req.migration_id)
         record["phase"] = "committed"
         return {"shard_id": shard_id, "migration_id": req.migration_id,
@@ -263,6 +305,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     def migration_abort(req: MigrationCommitRequest):
         """Give up: unfreeze and keep serving the range as before."""
         frozen_ranges.pop(req.migration_id, None)
+        sync_blocked_ranges()
         store.disarm_range(req.migration_id)
         record = migrations.pop(req.migration_id, None)
         return {"shard_id": shard_id, "aborted": req.migration_id,
@@ -276,6 +319,7 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.get("/internal/migration/state")
     def migration_state():
         return {"shard_id": shard_id, "armed": store.armed_range,
+                "blocked": [list(r) for r in store.blocked_ranges],
                 "frozen": {k: list(v) for k, v in frozen_ranges.items()},
                 "donated": [list(r) for r in donated_ranges],
                 "migrations": migrations}
@@ -307,13 +351,13 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
         """
         donated_ranges[:] = [r for r in donated_ranges
                              if r[1] <= req.lo or r[0] >= req.hi]
+        sync_blocked_ranges()
         return {"shard_id": shard_id, "accepted": [req.lo, req.hi],
                 "donated": [list(r) for r in donated_ranges]}
 
     @app.post("/documents", status_code=201)
     async def insert(req: InsertRequest, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
-        guard_migration(str(req.document.get(shard_key, "")), writing=True)
         try:
             doc = store.insert(req.document)
         except DuplicateKeyError as exc:
@@ -327,8 +371,6 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.post("/documents/bulk", status_code=201)
     async def insert_many(req: BulkInsertRequest, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
-        for doc in req.documents:
-            guard_migration(str(doc.get(shard_key, "")), writing=True)
         try:
             n = store.insert_many(req.documents, overwrite=req.overwrite)
         except DuplicateKeyError as exc:
@@ -342,7 +384,6 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     async def update(doc_id: str, req: UpdateRequest,
                      x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
-        guard_migration(doc_id, writing=True)
         try:
             doc, created = store.update(doc_id, req.update, upsert=req.upsert)
         except DocumentNotFound as exc:
@@ -356,7 +397,6 @@ def create_app(shard_id: str, db_path: str, shard_key: str = "_id",
     @app.delete("/documents/{doc_id}")
     async def delete(doc_id: str, x_ownership_epoch: int = Header(default=1)):
         validate_epoch(x_ownership_epoch)
-        guard_migration(doc_id, writing=True)
         if not store.delete(doc_id):
             raise HTTPException(status_code=404, detail=f"no document with _id {doc_id!r}")
         await replicate("delete", {"doc_id": doc_id}, x_ownership_epoch)
