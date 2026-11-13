@@ -140,12 +140,18 @@ class ChunkMigrator:
 
     # -- shard calls ----------------------------------------------------
 
+    def _send(self, node: ShardInfo, method: str, path: str,
+              json_body: Any | None, headers: dict[str, str],
+              params: dict[str, Any] | None) -> httpx.Response:
+        """The single place a shard is contacted; overridden by the tests."""
+        return self.client.request(method, f"{node.base_url}{path}",
+                                   json=json_body, params=params, headers=headers)
+
     def _request(self, node: ShardInfo, method: str, path: str,
                  json_body: Any | None = None, epoch: int | None = None,
                  params: dict[str, Any] | None = None) -> dict[str, Any]:
         headers = {"X-Ownership-Epoch": str(epoch)} if epoch is not None else {}
-        response = self.client.request(method, f"{node.base_url}{path}",
-                                       json=json_body, params=params, headers=headers)
+        response = self._send(node, method, path, json_body, headers, params)
         if response.status_code >= 400:
             try:
                 detail = response.json().get("detail", response.text)
