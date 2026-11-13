@@ -1,0 +1,64 @@
+{
+  "recorded_at": "2026-11-13 19:58:25",
+  "writers": 6,
+  "migration": {
+    "migration_id": "mig-5-90aa6571",
+    "chunk": {
+      "chunk_id": 5,
+      "lo": 2684354560,
+      "hi": 3221225472,
+      "span": 536870912
+    },
+    "source": "shard-1",
+    "destination": "shard-2",
+    "documents_moved": 2943,
+    "documents_at_arm": 2906,
+    "documents_cloned": 2907,
+    "changes_applied": 129,
+    "deletes_applied": 14,
+    "catchup_rounds": 1,
+    "removed_from_source": 2943,
+    "map_version": {
+      "before": 2,
+      "after": 3
+    },
+    "timing_ms": {
+      "clone": 460.895,
+      "catchup": 34.82,
+      "cutover": 35.94,
+      "total": 570.382
+    },
+    "verified": true,
+    "verification": {
+      "source_documents_left": 0,
+      "destination_documents": 2943,
+      "destination_digest": "f558b5c750f83cbcb7a624b4accfa7f0"
+    }
+  },
+  "migration_wall_ms": 589.079,
+  "write_ops": {
+    "insert": 900,
+    "delete": 341,
+    "update": 1057
+  },
+  "write_errors": {},
+  "verification": {
+    "documents_in_cluster": 20559,
+    "documents_in_migrated_range": 3061,
+    "acknowledged_live": 559,
+    "acknowledged_deleted": 341,
+    "indeterminate_writes": 0,
+    "checked_documents": 559,
+    "lost_documents": 0,
+    "duplicate_documents": 0,
+    "resurrected_deletes": 0,
+    "stale_values": 0,
+    "examples": {
+      "lost": [],
+      "duplicated": [],
+      "resurrected": [],
+      "stale": []
+    }
+  },
+  "passed": true
+}

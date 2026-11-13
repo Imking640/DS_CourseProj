@@ -1,0 +1,72 @@
+[
+  {
+    "recorded_at": "2026-11-13 19:58:05",
+    "migration_id": "mig-3-755d3545",
+    "chunk": {
+      "chunk_id": 3,
+      "lo": 1610612736,
+      "hi": 2147483648,
+      "span": 536870912
+    },
+    "source": "shard-3",
+    "destination": "shard-0",
+    "documents_moved": 2551,
+    "documents_at_arm": 2551,
+    "documents_cloned": 2551,
+    "changes_applied": 0,
+    "deletes_applied": 0,
+    "catchup_rounds": 1,
+    "removed_from_source": 2551,
+    "map_version": {
+      "before": 1,
+      "after": 2
+    },
+    "timing_ms": {
+      "clone": 246.594,
+      "catchup": 2.079,
+      "cutover": 44.582,
+      "total": 329.034
+    },
+    "verified": true,
+    "verification": {
+      "source_documents_left": 0,
+      "destination_documents": 2551,
+      "destination_digest": "5d74fcd1b48d56d4ff01e9eb2ddf8ea5"
+    }
+  },
+  {
+    "recorded_at": "2026-11-13 19:58:50",
+    "migration_id": "mig-4-97e5fff3",
+    "chunk": {
+      "chunk_id": 4,
+      "lo": 2147483648,
+      "hi": 2684354560,
+      "span": 536870912
+    },
+    "source": "shard-0-follower",
+    "destination": "shard-3",
+    "documents_moved": 2509,
+    "documents_at_arm": 2509,
+    "documents_cloned": 2509,
+    "changes_applied": 0,
+    "deletes_applied": 0,
+    "catchup_rounds": 1,
+    "removed_from_source": 2509,
+    "map_version": {
+      "before": 4,
+      "after": 5
+    },
+    "timing_ms": {
+      "clone": 162.024,
+      "catchup": 1.245,
+      "cutover": 13.691,
+      "total": 202.705
+    },
+    "verified": true,
+    "verification": {
+      "source_documents_left": 0,
+      "destination_documents": 2509,
+      "destination_digest": "ecede15800749cb9d5460e8172561665"
+    }
+  }
+]

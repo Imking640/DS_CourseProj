@@ -40,7 +40,7 @@ donor                                   recipient
 ```
 
 Steps 1–3 run with the donor fully serving reads and writes. Only step 4
-blocks writes, and only for the range being moved — measured at **24–44 ms**
+blocks writes, and only for the range being moved — measured at **14–45 ms**
 on the runs below.
 
 ### Arming before counting
@@ -90,7 +90,8 @@ request passes the freeze check
 ```
 
 That silently destroyed acknowledged writes — the harness reported 5 lost and
-1 stale document on the first run.
+1 stale document on its first run, which is exactly the failure this phase
+exists to rule out.
 
 The check now lives in `DocumentStore`, evaluated while holding the same lock
 that performs the write (`RangeNotOwned`). Taking that lock in
@@ -136,16 +137,23 @@ roughly 8× the accepted write throughput during a migration.
 4 shards + 4 followers, 20 000 seeded documents, 6 concurrent writers aimed at
 the chunk being moved. Full output in `results/`.
 
+### A quiescent move, for reference
+
+Chunk 3 (`shard-3` → `shard-0`): **2 551 documents moved**, map version 1 → 2,
+cutover 44.6 ms, total 329 ms, verified.
+
 ### Migration under live writes
+
+Chunk 5, `shard-1` → `shard-2`, with 6 writers aimed at the moving range:
 
 | | |
 |---|---|
-| documents moved | **2 952** |
-| copied in the clone phase | 2 915 |
-| live changes carried over | 152 (20 of them deletes) |
-| writes accepted during the migration | 2 122 |
+| documents moved | **2 943** |
+| copied in the clone phase | 2 907 |
+| live changes carried over | 129 (14 of them deletes) |
+| writes accepted during the migration | 2 298 |
 | write errors | 0 |
-| cutover write-freeze | **43.9 ms** |
+| cutover write-freeze | **35.9 ms** |
 | **lost documents** | **0** |
 | **duplicate documents** | **0** |
 | resurrected deletes | 0 |
@@ -154,19 +162,19 @@ the chunk being moved. Full output in `results/`.
 The harness classes each write as acknowledged, rejected or *indeterminate*,
 and excludes only indeterminate ones from the comparison — a write whose
 outcome the client never learned proves nothing in either direction. On the
-recorded run there were none, so all 532 tracked documents were checked
+recorded run there were none, so all 559 tracked documents were checked
 strictly.
 
 ### Destination replica
 
-After moving chunk 3 to `shard-0`, comparing the range on all four nodes:
+After the chunk 5 move, comparing that range on all four nodes involved:
 
 | node | documents in range | digest |
 |---|---:|---|
-| `shard-0` (destination primary) | 3 083 | `d1652ac36f05…` |
-| `shard-0-follower` | 3 083 | `d1652ac36f05…` |
-| `shard-3` (donor primary) | 0 | — |
-| `shard-3-follower` | 0 | — |
+| `shard-2` (destination primary) | 3 061 | `ad396643ab64…` |
+| `shard-2-follower` | 3 061 | `ad396643ab64…` |
+| `shard-1` (donor primary) | 0 | — |
+| `shard-1-follower` | 0 | — |
 
 The destination's follower is byte-identical to its primary: ingest batches go
 through the ordinary replication path, so the follower receives them like any
@@ -175,15 +183,17 @@ sheds the range rather than keeping orphans.
 
 ### Migration after a failover
 
-`shard-1`'s primary was killed, the follower was promoted (epoch 2, recovery
-25.9 ms), and chunk 5 — then owned by `shard-1-follower` — was migrated to
-`shard-2`:
+`shard-0`'s primary was killed, its follower was promoted (recovery 48.1 ms),
+and chunk 4 — then owned by `shard-0-follower` — was migrated to `shard-3`:
 
 ```
-documents moved : 2502      map version : 3 -> 4
-cutover         : 23.2 ms   verified    : True
-cluster total   : 20532 documents before and after
+documents moved : 2509      map version : 4 -> 5
+cutover         : 13.7 ms   verified    : True
+cluster total   : 20559 documents before and after
 ```
+
+Migration and failover compose because a chunk's owner is whichever node is
+*active* for that logical shard, which the shard map already tracks.
 
 ## 7. What Phase 4 receives
 
